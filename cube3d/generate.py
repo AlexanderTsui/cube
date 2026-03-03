@@ -1,5 +1,7 @@
 import argparse
+import gc
 import os
+import sys
 
 import torch
 import trimesh
@@ -13,6 +15,29 @@ from cube3d.mesh_utils.postprocessing import (
     save_mesh,
 )
 from cube3d.renderer import renderer
+
+
+def is_cuda_oom(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message and "cuda" in message
+
+
+def clear_cuda_memory(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+
+def relaunch_without_fast_inference() -> None:
+    new_args = [arg for arg in sys.argv[1:] if arg != "--fast-inference"]
+    new_env = os.environ.copy()
+    new_env["CUBE3D_FAST_FALLBACK"] = "1"
+    print("Relaunching without --fast-inference due to CUDA OOM.")
+    os.execvpe(
+        sys.executable, [sys.executable, "-m", "cube3d.generate", *new_args], new_env
+    )
 
 
 def generate_mesh(
@@ -126,16 +151,34 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     device = select_device()
     print(f"Using device: {device}")
+    fast_fallback_mode = os.environ.get("CUBE3D_FAST_FALLBACK") == "1"
     # Initialize engine based on fast_inference flag
-    if args.fast_inference:
+    using_fast_engine = False
+    if args.fast_inference and not fast_fallback_mode:
         print(
             "Using cuda graphs, this will take some time to warmup and capture the graph."
         )
-        engine = EngineFast(
-            args.config_path, args.gpt_ckpt_path, args.shape_ckpt_path, device=device
-        )
-        print("Compiled the graph.")
+        try:
+            engine = EngineFast(
+                args.config_path,
+                args.gpt_ckpt_path,
+                args.shape_ckpt_path,
+                device=device,
+            )
+            using_fast_engine = True
+            print("Compiled the graph.")
+        except RuntimeError as exc:
+            if not is_cuda_oom(exc):
+                raise
+            print(
+                "WARNING: Fast inference failed with CUDA OOM during graph setup. "
+                "Relaunching without fast inference."
+            )
+            clear_cuda_memory(device)
+            relaunch_without_fast_inference()
     else:
+        if args.fast_inference and fast_fallback_mode:
+            print("Fast-inference fallback mode active, running standard inference.")
         engine = Engine(
             args.config_path, args.gpt_ckpt_path, args.shape_ckpt_path, device=device
         )
@@ -144,16 +187,26 @@ if __name__ == "__main__":
         args.bounding_box_xyz = normalize_bbox(tuple(args.bounding_box_xyz))
 
     # Generate meshes based on input source
-    obj_path = generate_mesh(
-        engine,
-        args.prompt,
-        args.output_dir,
-        "output",
-        args.resolution_base,
-        args.disable_postprocessing,
-        args.top_p,
-        args.bounding_box_xyz,
-    )
+    try:
+        obj_path = generate_mesh(
+            engine,
+            args.prompt,
+            args.output_dir,
+            "output",
+            args.resolution_base,
+            args.disable_postprocessing,
+            args.top_p,
+            args.bounding_box_xyz,
+        )
+    except RuntimeError as exc:
+        if not (using_fast_engine and is_cuda_oom(exc)):
+            raise
+        print(
+            "WARNING: Fast inference failed with CUDA OOM during generation. "
+            "Relaunching without fast inference."
+        )
+        clear_cuda_memory(device)
+        relaunch_without_fast_inference()
     if args.render_gif:
         gif_path = renderer.render_turntable(obj_path, args.output_dir)
         print(f"Rendered turntable gif for {args.prompt} at `{gif_path}`")
