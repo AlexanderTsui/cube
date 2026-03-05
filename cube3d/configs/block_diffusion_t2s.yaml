@@ -1,0 +1,35 @@
+model:
+  base_config_path: "cube3d/configs/open_model_v0.5.yaml"
+  gpt_ckpt_path: "model_weights/shape_gpt.safetensors"
+  shape_ckpt_path: "model_weights/shape_tokenizer.safetensors"
+
+runtime:
+  device: "auto"
+  output_dir: "outputs/block_diffusion"
+
+data:
+  manifest_path: "/root/autodl-tmp/bdcube_dataset/manifests/pairs_bdcube.jsonl"
+  val_ratio: 0.2
+  seed: 42
+
+diffusion:
+  block_size: 32
+  num_steps: 8
+  beta_low: 0.3
+  beta_high: 0.8
+  cfg_drop_prob: 0.1
+
+train:
+  batch_size: 2
+  num_workers: 0
+  lr: 2.0e-4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp_dtype: "bfloat16"
+  max_steps: 200
+  log_every: 10
+  eval_every: 20
+  val_max_batches: 20
+  save_every: 50

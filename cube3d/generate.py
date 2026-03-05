@@ -7,6 +7,7 @@ import torch
 import trimesh
 
 from cube3d.inference.engine import Engine, EngineFast
+from cube3d.inference.engine_block_diffusion import EngineBlockDiffusion
 from cube3d.inference.utils import normalize_bbox, select_device
 from cube3d.mesh_utils.postprocessing import (
     PYMESHLAB_AVAILABLE,
@@ -147,41 +148,76 @@ if __name__ == "__main__":
         default=8.0,
         help="Resolution base for the shape decoder.",
     )
+    parser.add_argument(
+        "--use-block-diffusion",
+        help="Use block diffusion engine instead of autoregressive GPT engine.",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=32,
+        help="Block size for block diffusion sampling.",
+    )
+    parser.add_argument(
+        "--num-diffusion-steps",
+        type=int,
+        default=8,
+        help="Number of denoising steps per block for block diffusion sampling.",
+    )
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = select_device()
     print(f"Using device: {device}")
+
+    if args.use_block_diffusion and args.fast_inference:
+        print(
+            "WARNING: --fast-inference is not supported with --use-block-diffusion, ignoring fast mode."
+        )
+        args.fast_inference = False
+
     fast_fallback_mode = os.environ.get("CUBE3D_FAST_FALLBACK") == "1"
     # Initialize engine based on fast_inference flag
     using_fast_engine = False
-    if args.fast_inference and not fast_fallback_mode:
-        print(
-            "Using cuda graphs, this will take some time to warmup and capture the graph."
+    if args.use_block_diffusion:
+        engine = EngineBlockDiffusion(
+            args.config_path,
+            args.gpt_ckpt_path,
+            args.shape_ckpt_path,
+            device=device,
+            block_size=args.block_size,
+            num_denoise_steps=args.num_diffusion_steps,
         )
-        try:
-            engine = EngineFast(
-                args.config_path,
-                args.gpt_ckpt_path,
-                args.shape_ckpt_path,
-                device=device,
-            )
-            using_fast_engine = True
-            print("Compiled the graph.")
-        except RuntimeError as exc:
-            if not is_cuda_oom(exc):
-                raise
-            print(
-                "WARNING: Fast inference failed with CUDA OOM during graph setup. "
-                "Relaunching without fast inference."
-            )
-            clear_cuda_memory(device)
-            relaunch_without_fast_inference()
     else:
-        if args.fast_inference and fast_fallback_mode:
-            print("Fast-inference fallback mode active, running standard inference.")
-        engine = Engine(
-            args.config_path, args.gpt_ckpt_path, args.shape_ckpt_path, device=device
-        )
+        if args.fast_inference and not fast_fallback_mode:
+            print(
+                "Using cuda graphs, this will take some time to warmup and capture the graph."
+            )
+            try:
+                engine = EngineFast(
+                    args.config_path,
+                    args.gpt_ckpt_path,
+                    args.shape_ckpt_path,
+                    device=device,
+                )
+                using_fast_engine = True
+                print("Compiled the graph.")
+            except RuntimeError as exc:
+                if not is_cuda_oom(exc):
+                    raise
+                print(
+                    "WARNING: Fast inference failed with CUDA OOM during graph setup. "
+                    "Relaunching without fast inference."
+                )
+                clear_cuda_memory(device)
+                relaunch_without_fast_inference()
+        else:
+            if args.fast_inference and fast_fallback_mode:
+                print("Fast-inference fallback mode active, running standard inference.")
+            engine = Engine(
+                args.config_path, args.gpt_ckpt_path, args.shape_ckpt_path, device=device
+            )
 
     if args.bounding_box_xyz is not None:
         args.bounding_box_xyz = normalize_bbox(tuple(args.bounding_box_xyz))
