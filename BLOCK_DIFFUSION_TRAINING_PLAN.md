@@ -240,6 +240,20 @@ python -m cube3d.train.runners.train_block_diffusion_t2s \
   --config cube3d/configs/block_diffusion_t2s.yaml
 ```
 
+### 8.1.1 双卡正式训练（DDP）
+
+```bash
+torchrun --nproc_per_node=2 --standalone \
+  -m cube3d.train.runners.train_block_diffusion_t2s \
+  --config cube3d/configs/block_diffusion_t2s.yaml
+```
+
+### 8.1.2 TensorBoard（本机端口映射）
+
+```bash
+tensorboard --logdir outputs/block_diffusion/tb --host 127.0.0.1 --port 6006
+```
+
 ### 8.2 推理 smoke
 
 ```bash
@@ -418,3 +432,87 @@ python -m cube3d.train.runners.train_block_diffusion_t2s \
 4. 推理全流程：`checkpoint -> block diffusion sampling -> decode -> obj` 跑通
 
 当前主要问题不是功能正确性，而是 **CUDA 全参数训练显存不足（AdamW OOM）**。后续应优先做训练内存优化，再推进更长步数与正式训练。
+
+---
+
+## 12. 数据蒸馏扩展（2026-03-05）
+
+本节记录“使用当前已下载 Objaverse 数据（约 49GB GLB）继续蒸馏 Block Diffusion 训练数据”的执行结果。
+
+### 12.1 输入去重与可用样本
+
+原始输入：
+
+- `/root/autodl-tmp/objaverse_subset/manifests/pairs.jsonl`：`13535` 行
+
+去重与可用性筛选（按 `uid` 去重，剔除缺失 `glb`）后：
+
+- unique uid：`5130`
+- 缺失 glb（unique）：`8`
+- 可处理样本：`5122`
+- 去重清单：`/tmp/objaverse_pairs_unique_existing_20260305.jsonl`
+
+### 12.2 蒸馏执行
+
+执行命令：
+
+```bash
+python dataset/build_bdcube_dataset.py \
+  --pairs-jsonl /tmp/objaverse_pairs_unique_existing_20260305.jsonl \
+  --output-root /root/autodl-tmp/bdcube_dataset \
+  --device cuda
+```
+
+说明：
+
+- 采用“续跑”方式（不加 `--overwrite`），复用已完成样本并继续追加。
+- 历史基线：已完成 `436`，失败 `11`（2026-03-04）。
+
+本次新增结果：
+
+- 新增完成：`4471`
+- 新增失败：`215`
+
+累计结果（当前）：
+
+- `pairs_bdcube.jsonl`：`4907` 行
+- `completed_uids.txt`：`4907` 行
+- `failed_uids.txt`：`226` 行
+- `features/**/*.npz`：`4907` 个
+
+### 12.3 训练可用性校验
+
+一致性检查：
+
+- manifest 行数 = completed 行数 = npz 文件数 = `4907`
+- manifest 中 `feature_path` 缺失数：`0`
+
+字段抽检（随机样本）：
+
+- `shape_ids`: `(1024,) int32`
+- `text_hidden`: `(77, 768) float16`
+- `text_attention_mask`: `(77,) int8`
+- `bbox_xyz`: `(3,) float32`
+
+DataLoader 校验（`val_ratio=0.2, seed=42`）：
+
+- train: `3930`
+- val: `977`
+- batch 形状：
+  - `shape_ids`: `(4, 1024)` `int64`
+  - `text_hidden`: `(4, 77, 768)` `float32`
+  - `text_attention_mask`: `(4, 77)` `bool`
+  - `bbox_xyz`: `(4, 3)` `float32`
+
+训练 smoke（基于新蒸馏数据）：
+
+```bash
+python -m cube3d.train.runners.train_block_diffusion_t2s \
+  --config /tmp/block_diffusion_train_smoke_20260305.yaml
+```
+
+结果（`device=cpu, max_steps=1`，exit code 0）：
+
+- `step=1 train_loss=90.8017`
+- `val_loss=148.7541`
+- checkpoint: `/tmp/block_diffusion_train_smoke_20260305/block_diffusion_step_1.safetensors`

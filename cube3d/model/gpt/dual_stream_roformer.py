@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from cube3d.model.transformers.cache import Cache
 from cube3d.model.transformers.dual_stream_attention import (
@@ -61,6 +63,7 @@ class DualStreamRoformer(nn.Module):
         super().__init__()
 
         self.cfg = cfg
+        self.gradient_checkpointing = False
 
         self.text_proj = nn.Linear(
             in_features=self.cfg.text_model_embed_dim,
@@ -177,7 +180,7 @@ class DualStreamRoformer(nn.Module):
                     device=device,
                 ),
             )
-            for _ in range(len(self.transformer.dual_blocks))
+            for _ in range(len(self.transformer.dual_blocks)) # type: ignore
         ]
         kv_cache += [
             Cache(
@@ -252,29 +255,67 @@ class DualStreamRoformer(nn.Module):
         h = embed
         c = cond
 
+        use_checkpointing = (
+            self.gradient_checkpointing
+            and self.training
+            and kv_cache is None
+            and not decode
+        )
+
         layer_idx = 0
-        for block in self.transformer.dual_blocks:
-            h, c = block(
-                h,
-                c=c,
-                freqs_cis=d_freqs_cis,
-                attn_mask=attn_mask,
-                is_causal=True,
-                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                curr_pos_id=curr_pos_id + s if curr_pos_id is not None else None,
-                decode=decode,
-            )
+        for block in self.transformer.dual_blocks: # type: ignore
+            if use_checkpointing:
+                h, c = checkpoint(
+                    partial(
+                        block,
+                        freqs_cis=d_freqs_cis,
+                        attn_mask=attn_mask,
+                        is_causal=True,
+                        kv_cache=None,
+                        curr_pos_id=None,
+                        decode=False,
+                    ),
+                    h,
+                    c,
+                    use_reentrant=False,
+                ) # type: ignore
+            else:
+                h, c = block(
+                    h,
+                    c=c,
+                    freqs_cis=d_freqs_cis,
+                    attn_mask=attn_mask,
+                    is_causal=True,
+                    kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                    curr_pos_id=curr_pos_id + s if curr_pos_id is not None else None,
+                    decode=decode,
+                )
             layer_idx += 1
         for block in self.transformer.single_blocks:
-            h = block(
-                h,
-                freqs_cis=s_freqs_cis,
-                attn_mask=None,
-                is_causal=True,
-                kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
-                curr_pos_id=curr_pos_id,
-                decode=decode,
-            )
+            if use_checkpointing:
+                h = checkpoint(
+                    partial(
+                        block,
+                        freqs_cis=s_freqs_cis,
+                        attn_mask=None,
+                        is_causal=True,
+                        kv_cache=None,
+                        curr_pos_id=None,
+                        decode=False,
+                    ),
+                    h,
+                    use_reentrant=False,
+                )
+            else:
+                h = block(
+                    h,
+                    freqs_cis=s_freqs_cis,
+                    attn_mask=None,
+                    is_causal=True,
+                    kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
+                    curr_pos_id=curr_pos_id,
+                    decode=decode,
+                )
             layer_idx += 1
 
         # Normalization
@@ -282,3 +323,6 @@ class DualStreamRoformer(nn.Module):
         logits = self.lm_head(h)
 
         return logits
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        self.gradient_checkpointing = bool(enabled)

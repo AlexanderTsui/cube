@@ -1,13 +1,22 @@
 import argparse
 import json
+import os
+import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Optional
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import save_model
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from cube3d.inference.utils import (
@@ -46,6 +55,30 @@ def _resolve_amp_dtype(name: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _autocast_context(device: torch.device, amp_dtype: torch.dtype):
+    return torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=device.type in {"cuda", "mps"},
+    )
+
+
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _ddp_world_size() -> int:
+    return dist.get_world_size() if _is_distributed() else 1
+
+
+def _ddp_rank() -> int:
+    return dist.get_rank() if _is_distributed() else 0
+
+
+def _is_main_process() -> bool:
+    return _ddp_rank() == 0
+
+
 def _prepare_condition(
     gpt_model: BlockDiffusionRoformer,
     text_hidden: torch.Tensor,
@@ -58,17 +91,74 @@ def _prepare_condition(
     return cond
 
 
-def _autocast_context(device: torch.device, amp_dtype: torch.dtype):
-    return torch.autocast(
-        device_type=device.type,
-        dtype=amp_dtype,
-        enabled=device.type in {"cuda", "mps"},
+def _reduce_mean(value: float, device: torch.device) -> float:
+    if not _is_distributed():
+        return float(value)
+    tensor = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= _ddp_world_size()
+    return float(tensor.item())
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _build_optimizer(
+    cfg: DictConfig, model: torch.nn.Module, is_main: bool
+) -> torch.optim.Optimizer:
+    optimizer_name = str(OmegaConf.select(cfg, "train.optimizer", default="adamw")).lower()
+    lr = float(cfg.train.lr)
+    betas = (float(cfg.train.beta1), float(cfg.train.beta2))
+    weight_decay = float(cfg.train.weight_decay)
+
+    if optimizer_name == "adamw_8bit":
+        try:
+            import bitsandbytes as bnb
+
+            if is_main:
+                print("[info] using bitsandbytes AdamW8bit optimizer")
+            return bnb.optim.AdamW8bit(
+                model.parameters(),
+                lr=lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            )
+        except ImportError:
+            if is_main:
+                print("[warn] bitsandbytes not found, fallback to torch.optim.AdamW")
+
+    if optimizer_name == "adamw_zero":
+        if _is_distributed():
+            from torch.distributed.optim import ZeroRedundancyOptimizer
+
+            if is_main:
+                print("[info] using ZeroRedundancyOptimizer(AdamW)")
+            return ZeroRedundancyOptimizer(
+                model.parameters(),
+                optimizer_class=torch.optim.AdamW,
+                lr=lr,
+                betas=betas,
+                weight_decay=weight_decay,
+            )
+        if is_main:
+            print("[warn] adamw_zero requested without DDP; fallback to torch.optim.AdamW")
+
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
     )
 
 
 @torch.no_grad()
 def evaluate(
-    model: BlockDiffusionRoformer,
+    model: torch.nn.Module,
+    base_model: BlockDiffusionRoformer,
     loader: DataLoader,
     schedule: ClippedMaskSchedule,
     num_codes: int,
@@ -79,15 +169,15 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
-    total_count = 0
+    total_count = 0.0
     total_acc = 0.0
 
     for batch_idx, batch in enumerate(loader):
         if max_batches > 0 and batch_idx >= max_batches:
             break
-        shape_ids = batch["shape_ids"].to(device)
-        text_hidden = batch["text_hidden"].to(device)
-        bbox_xyz = batch["bbox_xyz"].to(device)
+        shape_ids = batch["shape_ids"].to(device, non_blocking=True)
+        text_hidden = batch["text_hidden"].to(device, non_blocking=True)
+        bbox_xyz = batch["bbox_xyz"].to(device, non_blocking=True)
 
         bsz, seq_len = shape_ids.shape
         num_blocks = seq_len // block_size
@@ -98,12 +188,12 @@ def evaluate(
             block_indices=block_indices,
             mask_ratios=ratios,
             block_size=block_size,
-            mask_token_id=model.ensure_mask_token(),
+            mask_token_id=base_model.ensure_mask_token(),
         )
 
         with _autocast_context(device, amp_dtype):
-            cond = _prepare_condition(model, text_hidden, bbox_xyz)
-            logits = model(model.encode_token(noisy_ids), cond)[..., :num_codes]
+            cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
+            logits = model(base_model.encode_token(noisy_ids), cond)[..., :num_codes]
 
         if not masked.any():
             continue
@@ -119,15 +209,37 @@ def evaluate(
         acc = (preds == target).float().mean().item()
 
         total_loss += float(weighted_loss.item())
-        total_acc += acc
-        total_count += 1
+        total_acc += float(acc)
+        total_count += 1.0
 
+    stats = torch.tensor([total_loss, total_acc, total_count], device=device, dtype=torch.float64)
+    if _is_distributed():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    total_count = float(stats[2].item())
     if total_count == 0:
         return {"val_loss": 0.0, "val_mask_acc": 0.0}
     return {
-        "val_loss": total_loss / total_count,
-        "val_mask_acc": total_acc / total_count,
+        "val_loss": float(stats[0].item() / total_count),
+        "val_mask_acc": float(stats[1].item() / total_count),
     }
+
+
+def _init_distributed(cfg: DictConfig) -> tuple[bool, int, int]:
+    requested = bool(OmegaConf.select(cfg, "runtime.distributed", default=False))
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    has_rank_env = "RANK" in os.environ and "LOCAL_RANK" in os.environ
+    use_distributed = world_size_env > 1 or has_rank_env
+    if requested and not use_distributed:
+        return False, 0, 0
+    if not use_distributed:
+        return False, 0, 0
+
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+    rank = dist.get_rank()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    return True, rank, local_rank
 
 
 def main() -> None:
@@ -135,19 +247,36 @@ def main() -> None:
     cfg = load_config(args.config)
     assert isinstance(cfg, DictConfig)
 
-    base_cfg = load_config(cfg.model.base_config_path)
-    device = (
-        select_device()
-        if cfg.runtime.device == "auto"
-        else torch.device(str(cfg.runtime.device))
-    )
+    use_distributed, rank, local_rank = _init_distributed(cfg)
+    if bool(OmegaConf.select(cfg, "runtime.distributed", default=False)) and not use_distributed:
+        print("[warn] runtime.distributed=true but torchrun env not found; running single process.")
+
+    if use_distributed and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = (
+            select_device()
+            if cfg.runtime.device == "auto"
+            else torch.device(str(cfg.runtime.device))
+        )
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+
+    is_main = (rank == 0)
+    world_size = _ddp_world_size()
     amp_dtype = _resolve_amp_dtype(str(cfg.train.amp_dtype))
 
+    base_seed = int(OmegaConf.select(cfg, "runtime.seed", default=42))
+    _set_seed(base_seed + rank)
+
+    base_cfg = load_config(cfg.model.base_config_path)
     output_dir = Path(str(cfg.runtime.output_dir))
     _ensure_dir(output_dir)
-    with open(output_dir / "resolved_train_config.json", "w", encoding="utf-8") as f:
-        resolved = OmegaConf.to_container(cfg, resolve=True)
-        f.write(json.dumps(resolved, indent=2))
+    if is_main:
+        with open(output_dir / "resolved_train_config.json", "w", encoding="utf-8") as f:
+            resolved = OmegaConf.to_container(cfg, resolve=True)
+            f.write(json.dumps(resolved, indent=2))
 
     train_ds = BlockDiffusionDataset(
         manifest_path=str(cfg.data.manifest_path),
@@ -164,18 +293,52 @@ def main() -> None:
     if len(train_ds) == 0:
         raise RuntimeError("No training samples found. Check manifest and split setup.")
 
+    micro_batch_size = int(
+        OmegaConf.select(cfg, "train.micro_batch_size_per_gpu", default=int(cfg.train.batch_size))
+    )
+    grad_accum_steps = int(OmegaConf.select(cfg, "train.grad_accum_steps", default=1))
+    if grad_accum_steps < 1:
+        raise ValueError("train.grad_accum_steps must be >= 1")
+    if is_main:
+        effective_batch = micro_batch_size * grad_accum_steps * world_size
+        print(
+            "[info] training setup: "
+            f"micro_batch_per_gpu={micro_batch_size}, grad_accum_steps={grad_accum_steps}, "
+            f"world_size={world_size}, effective_batch={effective_batch}"
+        )
+
+    train_sampler: Optional[DistributedSampler] = None
+    val_sampler: Optional[DistributedSampler] = None
+    if use_distributed:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=int(cfg.train.batch_size),
-        shuffle=True,
+        batch_size=micro_batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=int(cfg.train.num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=int(cfg.train.batch_size),
+        batch_size=micro_batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=int(cfg.train.num_workers),
         pin_memory=(device.type == "cuda"),
         drop_last=False,
@@ -185,9 +348,9 @@ def main() -> None:
         BlockDiffusionRoformer.Config,
         base_cfg.gpt_model,
     )
-    model = BlockDiffusionRoformer(gpt_cfg)
-    load_model_weights(model, str(cfg.model.gpt_ckpt_path))
-    model = model.to(device)
+    base_model = BlockDiffusionRoformer(gpt_cfg)
+    load_model_weights(base_model, str(cfg.model.gpt_ckpt_path))
+    base_model = base_model.to(device)
 
     shape_model = OneDAutoEncoder(
         parse_structured(OneDAutoEncoder.Config, base_cfg.shape_model)
@@ -198,16 +361,30 @@ def main() -> None:
     # Align shape token embeddings with tokenizer codebook for stable initialization.
     with torch.no_grad():
         codebook = shape_model.bottleneck.block.get_codebook()
-        codebook = model.shape_proj(codebook).detach()
+        codebook = base_model.shape_proj(codebook).detach()
         codebook = codebook.to(
-            model.transformer.wte.weight.device, dtype=model.transformer.wte.weight.dtype
+            base_model.transformer.wte.weight.device,
+            dtype=base_model.transformer.wte.weight.dtype,
         )
-        model.transformer.wte.weight.data[: codebook.shape[0]] = codebook
-        model.lm_head.weight.data[: codebook.shape[0]] = codebook
+        base_model.transformer.wte.weight.data[: codebook.shape[0]] = codebook
+        base_model.lm_head.weight.data[: codebook.shape[0]] = codebook
 
-    model.ensure_mask_token()
-    model = model.train()
+    base_model.ensure_mask_token()
+    base_model.set_gradient_checkpointing(
+        bool(OmegaConf.select(cfg, "train.grad_checkpoint", default=False))
+    )
+    base_model = base_model.train()
     del shape_model
+
+    model: torch.nn.Module = base_model
+    if use_distributed:
+        model = DDP(
+            base_model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
 
     num_codes = int(base_cfg.shape_model.num_codes)
     block_size = int(cfg.diffusion.block_size)
@@ -219,134 +396,219 @@ def main() -> None:
         beta_high=float(cfg.diffusion.beta_high),
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(cfg.train.lr),
-        betas=(float(cfg.train.beta1), float(cfg.train.beta2)),
-        weight_decay=float(cfg.train.weight_decay),
+    optimizer = _build_optimizer(cfg, model, is_main)
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=(device.type == "cuda" and amp_dtype == torch.float16),
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and amp_dtype == torch.float16))
+
+    writer = None
+    if is_main and bool(OmegaConf.select(cfg, "logging.tensorboard", default=True)):
+        tb_log_dir = Path(str(OmegaConf.select(cfg, "logging.tb_log_dir", default=output_dir / "tb")))
+        _ensure_dir(tb_log_dir)
+        writer = SummaryWriter(log_dir=str(tb_log_dir))
+        print(f"[info] tensorboard log_dir={tb_log_dir}")
 
     step = 0
     running_loss = 0.0
     running_acc = 0.0
-    running_count = 0
+    running_count = 0.0
+    running_iter_time = 0.0
+    train_epoch = 0
+    if train_sampler is not None:
+        train_sampler.set_epoch(train_epoch)
     train_iter = iter(train_loader)
     start_time = time.time()
 
-    pbar = tqdm(total=num_steps, desc="train_block_diffusion")
-    while step < num_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+    pbar = tqdm(total=num_steps, desc="train_block_diffusion", disable=not is_main)
+    try:
+        while step < num_steps:
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
 
-        model.train()
-        shape_ids = batch["shape_ids"].to(device)
-        text_hidden = batch["text_hidden"].to(device)
-        bbox_xyz = batch["bbox_xyz"].to(device)
+            step_loss_sum = 0.0
+            step_acc_sum = 0.0
+            step_count = 0.0
+            iter_start = time.time()
 
-        if float(cfg.diffusion.cfg_drop_prob) > 0:
-            drop_mask = (
-                torch.rand(shape_ids.shape[0], device=device) < float(cfg.diffusion.cfg_drop_prob)
-            )
-            text_hidden = text_hidden.clone()
-            text_hidden[drop_mask] = 0
+            for micro_idx in range(grad_accum_steps):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_epoch += 1
+                    if train_sampler is not None:
+                        train_sampler.set_epoch(train_epoch)
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
 
-        bsz, seq_len = shape_ids.shape
-        if seq_len % block_size != 0:
-            raise RuntimeError(f"Sequence length {seq_len} not divisible by block_size {block_size}")
-        num_blocks = seq_len // block_size
+                shape_ids = batch["shape_ids"].to(device, non_blocking=True)
+                text_hidden = batch["text_hidden"].to(device, non_blocking=True)
+                bbox_xyz = batch["bbox_xyz"].to(device, non_blocking=True)
 
-        block_indices = torch.randint(0, num_blocks, (bsz,), device=device)
-        ratios = schedule.sample_ratio(bsz, device=device)
-        noisy_ids, masked = mask_one_block_per_sample(
-            shape_ids=shape_ids,
-            block_indices=block_indices,
-            mask_ratios=ratios,
-            block_size=block_size,
-            mask_token_id=model.ensure_mask_token(),
-        )
+                if float(cfg.diffusion.cfg_drop_prob) > 0:
+                    drop_mask = (
+                        torch.rand(shape_ids.shape[0], device=device)
+                        < float(cfg.diffusion.cfg_drop_prob)
+                    )
+                    text_hidden = text_hidden.clone()
+                    text_hidden[drop_mask] = 0
 
-        optimizer.zero_grad(set_to_none=True)
+                bsz, seq_len = shape_ids.shape
+                if seq_len % block_size != 0:
+                    raise RuntimeError(
+                        f"Sequence length {seq_len} not divisible by block_size {block_size}"
+                    )
+                num_blocks = seq_len // block_size
 
-        with _autocast_context(device, amp_dtype):
-            cond = _prepare_condition(model, text_hidden, bbox_xyz)
-            logits = model(model.encode_token(noisy_ids), cond)[..., :num_codes]
+                block_indices = torch.randint(0, num_blocks, (bsz,), device=device)
+                ratios = schedule.sample_ratio(bsz, device=device)
+                noisy_ids, masked = mask_one_block_per_sample(
+                    shape_ids=shape_ids,
+                    block_indices=block_indices,
+                    mask_ratios=ratios,
+                    block_size=block_size,
+                    mask_token_id=base_model.ensure_mask_token(),
+                )
 
-        target = shape_ids[masked]
-        masked_logits = logits[masked]
-        ce = F.cross_entropy(masked_logits.float(), target, reduction="none")
-        weights = schedule.weight_from_ratio(ratios)
-        token_weights = (weights[:, None].expand_as(masked))[masked]
-        loss = (ce * token_weights).mean()
+                sync_context = (
+                    model.no_sync()
+                    if use_distributed and micro_idx < grad_accum_steps - 1
+                    else nullcontext()
+                )
+                with sync_context:
+                    with _autocast_context(device, amp_dtype):
+                        cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
+                        logits = model(base_model.encode_token(noisy_ids), cond)[..., :num_codes]
 
-        if scaler.is_enabled():
-            scaler.scale(loss).backward()
-            if grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+                    target = shape_ids[masked]
+                    masked_logits = logits[masked]
+                    ce = F.cross_entropy(masked_logits.float(), target, reduction="none")
+                    weights = schedule.weight_from_ratio(ratios)
+                    token_weights = (weights[:, None].expand_as(masked))[masked]
+                    loss = (ce * token_weights).mean()
+                    loss_to_backward = loss / grad_accum_steps
 
-        with torch.no_grad():
-            pred = masked_logits.argmax(dim=-1)
-            acc = (pred == target).float().mean().item()
+                    if scaler.is_enabled():
+                        scaler.scale(loss_to_backward).backward()
+                    else:
+                        loss_to_backward.backward()
 
-        running_loss += float(loss.item())
-        running_acc += float(acc)
-        running_count += 1
-        step += 1
-        pbar.update(1)
+                with torch.no_grad():
+                    pred = masked_logits.argmax(dim=-1)
+                    acc = (pred == target).float().mean().item()
 
-        if step % int(cfg.train.log_every) == 0:
-            avg_loss = running_loss / max(running_count, 1)
-            avg_acc = running_acc / max(running_count, 1)
-            elapsed = time.time() - start_time
-            print(
-                f"[train] step={step} loss={avg_loss:.4f} "
-                f"mask_acc={avg_acc:.4f} elapsed_s={elapsed:.1f}"
-            )
-            running_loss = 0.0
-            running_acc = 0.0
-            running_count = 0
+                step_loss_sum += float(loss.item())
+                step_acc_sum += float(acc)
+                step_count += 1.0
 
-        if step % int(cfg.train.eval_every) == 0 and len(val_ds) > 0:
-            metrics = evaluate(
-                model=model,
-                loader=val_loader,
-                schedule=schedule,
-                num_codes=num_codes,
-                block_size=block_size,
-                amp_dtype=amp_dtype,
-                device=device,
-                max_batches=int(cfg.train.val_max_batches),
-            )
-            print(
-                f"[val] step={step} val_loss={metrics['val_loss']:.4f} "
-                f"val_mask_acc={metrics['val_mask_acc']:.4f}"
-            )
+            if scaler.is_enabled():
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                else:
+                    grad_norm = torch.tensor(0.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                else:
+                    grad_norm = torch.tensor(0.0)
+                optimizer.step()
 
-        if step % int(cfg.train.save_every) == 0 or step == num_steps:
-            ckpt_path = output_dir / f"block_diffusion_step_{step}.safetensors"
-            save_model(model, str(ckpt_path))
-            meta = {
-                "step": step,
-                "num_codes": num_codes,
-                "block_size": block_size,
-                "shape_mask_id": model.shape_mask_id,
-            }
-            with open(output_dir / f"block_diffusion_step_{step}.json", "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-            print(f"[ckpt] saved {ckpt_path}")
+            step_loss = step_loss_sum / max(step_count, 1.0)
+            step_acc = step_acc_sum / max(step_count, 1.0)
+            iter_time = time.time() - iter_start
+            step_loss = _reduce_mean(step_loss, device)
+            step_acc = _reduce_mean(step_acc, device)
+            iter_time = _reduce_mean(iter_time, device)
+            grad_norm_val = _reduce_mean(float(grad_norm), device)
 
-    pbar.close()
+            running_loss += step_loss
+            running_acc += step_acc
+            running_iter_time += iter_time
+            running_count += 1.0
+            step += 1
+            pbar.update(1)
+
+            if step % int(cfg.train.log_every) == 0 and is_main:
+                avg_loss = running_loss / max(running_count, 1.0)
+                avg_acc = running_acc / max(running_count, 1.0)
+                avg_iter_time = running_iter_time / max(running_count, 1.0)
+                elapsed = time.time() - start_time
+                print(
+                    f"[train] step={step} loss={avg_loss:.4f} mask_acc={avg_acc:.4f} "
+                    f"iter_s={avg_iter_time:.3f} elapsed_s={elapsed:.1f}"
+                )
+                if writer is not None:
+                    writer.add_scalar("train/loss", avg_loss, step)
+                    writer.add_scalar("train/mask_acc", avg_acc, step)
+                    writer.add_scalar("train/iter_time_sec", avg_iter_time, step)
+                    writer.add_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), step)
+                    writer.add_scalar("train/grad_norm", grad_norm_val, step)
+                    if device.type == "cuda":
+                        writer.add_scalar(
+                            "system/gpu_mem_allocated_gb",
+                            torch.cuda.memory_allocated(device) / (1024**3),
+                            step,
+                        )
+                running_loss = 0.0
+                running_acc = 0.0
+                running_iter_time = 0.0
+                running_count = 0.0
+
+            if step % int(cfg.train.eval_every) == 0 and len(val_ds) > 0:
+                if val_sampler is not None:
+                    val_sampler.set_epoch(step)
+                metrics = evaluate(
+                    model=model,
+                    base_model=base_model,
+                    loader=val_loader,
+                    schedule=schedule,
+                    num_codes=num_codes,
+                    block_size=block_size,
+                    amp_dtype=amp_dtype,
+                    device=device,
+                    max_batches=int(cfg.train.val_max_batches),
+                )
+                if is_main:
+                    print(
+                        f"[val] step={step} val_loss={metrics['val_loss']:.4f} "
+                        f"val_mask_acc={metrics['val_mask_acc']:.4f}"
+                    )
+                    if writer is not None:
+                        writer.add_scalar("val/loss", metrics["val_loss"], step)
+                        writer.add_scalar("val/mask_acc", metrics["val_mask_acc"], step)
+
+            if step % int(cfg.train.save_every) == 0 or step == num_steps:
+                if is_main:
+                    ckpt_path = output_dir / f"block_diffusion_step_{step}.safetensors"
+                    save_model(base_model, str(ckpt_path))
+                    meta = {
+                        "step": step,
+                        "num_codes": num_codes,
+                        "block_size": block_size,
+                        "shape_mask_id": base_model.shape_mask_id,
+                        "world_size": world_size,
+                        "grad_accum_steps": grad_accum_steps,
+                        "micro_batch_size_per_gpu": micro_batch_size,
+                    }
+                    with open(
+                        output_dir / f"block_diffusion_step_{step}.json",
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        json.dump(meta, f, indent=2)
+                    print(f"[ckpt] saved {ckpt_path}")
+                if _is_distributed():
+                    dist.barrier()
+    finally:
+        pbar.close()
+        if writer is not None:
+            writer.close()
+        if _is_distributed():
+            dist.barrier()
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

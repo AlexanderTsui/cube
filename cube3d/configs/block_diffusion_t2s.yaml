@@ -5,7 +5,9 @@ model:
 
 runtime:
   device: "auto"
-  output_dir: "outputs/block_diffusion"
+  distributed: true
+  seed: 42
+  output_dir: "/root/autodl-tmp/block_diffusion_train"
 
 data:
   manifest_path: "/root/autodl-tmp/bdcube_dataset/manifests/pairs_bdcube.jsonl"
@@ -20,16 +22,24 @@ diffusion:
   cfg_drop_prob: 0.1
 
 train:
-  batch_size: 2
+  batch_size: 1
+  micro_batch_size_per_gpu: 1
+  grad_accum_steps: 8
   num_workers: 0
-  lr: 2.0e-4
+  lr: 1.0e-4
   beta1: 0.9
   beta2: 0.95
   weight_decay: 0.01
+  optimizer: "adamw_zero"
+  grad_checkpoint: true
   grad_clip: 1.0
   amp_dtype: "bfloat16"
-  max_steps: 200
-  log_every: 10
-  eval_every: 20
+  max_steps: 5000
+  log_every: 20
+  eval_every: 100
   val_max_batches: 20
-  save_every: 50
+  save_every: 500
+
+logging:
+  tensorboard: true
+  tb_log_dir: "/root/autodl-tmp/block_diffusion_train/tb"
