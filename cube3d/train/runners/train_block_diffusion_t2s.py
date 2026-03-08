@@ -28,7 +28,12 @@ from cube3d.inference.utils import (
 from cube3d.model.autoencoder.one_d_autoencoder import OneDAutoEncoder
 from cube3d.model.gpt.block_diffusion_roformer import BlockDiffusionRoformer
 from cube3d.train.data.block_diffusion_dataset import BlockDiffusionDataset
-from cube3d.train.noise.masked_schedule import ClippedMaskSchedule, mask_one_block_per_sample
+from cube3d.train.noise.bd3_schedule import (
+    LogLinearSchedule,
+    q_xt,
+    restrict_logits_to_codes_and_mask,
+    subs_parameterization,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +112,38 @@ def _set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _build_clip_intervals(
+    eps_min: float,
+    eps_max: float,
+    clip_search_delta: float,
+    clip_search_widths: list,
+) -> list[tuple[float, float]]:
+    intervals: list[tuple[float, float]] = [(float(eps_min), float(eps_max))]
+    if clip_search_delta <= 0 or len(clip_search_widths) == 0:
+        return intervals
+    for width in clip_search_widths:
+        w = float(width)
+        if w <= 0 or w > 1:
+            continue
+        i = 0.0
+        limit = max(0.0, 1.0 - w)
+        while i <= limit + 1e-8:
+            lo = max(float(eps_min), i)
+            hi = max(float(eps_min), i + w)
+            if hi <= 1.0 + 1e-8:
+                intervals.append((round(lo, 6), round(min(1.0, hi), 6)))
+            i += clip_search_delta
+    # keep deterministic unique order
+    seen: set[tuple[float, float]] = set()
+    deduped: list[tuple[float, float]] = []
+    for pair in intervals:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(pair)
+    return deduped
+
+
 def _build_optimizer(
     cfg: DictConfig, model: torch.nn.Module, is_main: bool
 ) -> torch.optim.Optimizer:
@@ -160,17 +197,22 @@ def evaluate(
     model: torch.nn.Module,
     base_model: BlockDiffusionRoformer,
     loader: DataLoader,
-    schedule: ClippedMaskSchedule,
+    schedule: LogLinearSchedule,
     num_codes: int,
     block_size: int,
     amp_dtype: torch.dtype,
     device: torch.device,
     max_batches: int,
+    eps_min: float,
+    eps_max: float,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_count = 0.0
     total_acc = 0.0
+    block_nll_means: list[float] = []
+
+    mask_token_id = int(base_model.ensure_mask_token())
 
     for batch_idx, batch in enumerate(loader):
         if max_batches > 0 and batch_idx >= max_batches:
@@ -180,35 +222,61 @@ def evaluate(
         bbox_xyz = batch["bbox_xyz"].to(device, non_blocking=True)
 
         bsz, seq_len = shape_ids.shape
-        num_blocks = seq_len // block_size
-        block_indices = torch.randint(0, num_blocks, (bsz,), device=device)
-        ratios = schedule.sample_ratio(bsz, device=device)
-        noisy_ids, masked = mask_one_block_per_sample(
-            shape_ids=shape_ids,
-            block_indices=block_indices,
-            mask_ratios=ratios,
+        t = schedule.sample_t(
+            batch_size=bsz,
+            seq_len=seq_len,
             block_size=block_size,
-            mask_token_id=base_model.ensure_mask_token(),
+            device=device,
+            eps_min=eps_min,
+            eps_max=eps_max,
+        )
+        move_chance = schedule.move_chance(t)
+        noisy_ids, _ = q_xt(
+            shape_ids,
+            move_chance=move_chance,
+            mask_token_id=mask_token_id,
+            block_size=block_size,
+            resample=schedule.resample,
+            eps_min=eps_min,
+            eps_max=eps_max,
         )
 
         with _autocast_context(device, amp_dtype):
             cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
-            logits = model(base_model.encode_token(noisy_ids), cond)[..., :num_codes]
+            x_input = torch.cat([noisy_ids, shape_ids], dim=1)
+            logits = model(
+                base_model.encode_token(x_input),
+                cond,
+                attention_mode="bd_training",
+                block_size=block_size,
+            )
+        logits = logits[:, :seq_len]
+        logits, mask_local_idx = restrict_logits_to_codes_and_mask(
+            logits=logits,
+            num_codes=num_codes,
+            mask_token_id=mask_token_id,
+        )
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        noisy_local = noisy_ids.clone()
+        noisy_local[noisy_local == mask_token_id] = mask_local_idx
+        log_probs = subs_parameterization(log_probs, noisy_local, mask_local_idx)
 
-        if not masked.any():
-            continue
-        target = shape_ids[masked]
-        masked_logits = logits[masked]
-        ce = F.cross_entropy(masked_logits.float(), target, reduction="none")
+        nll = -torch.gather(log_probs, -1, shape_ids.unsqueeze(-1)).squeeze(-1)
+        weights = schedule.loss_scale(t)
+        weighted_nll = nll * weights
+        loss = weighted_nll.mean()
 
-        weights = schedule.weight_from_ratio(ratios)
-        token_weights = (weights[:, None].expand_as(masked))[masked]
-        weighted_loss = (ce * token_weights).mean()
+        masked = noisy_ids.eq(mask_token_id)
+        if masked.any():
+            preds = logits.argmax(dim=-1)
+            acc = (preds[masked] == shape_ids[masked]).float().mean().item()
+        else:
+            acc = 0.0
 
-        preds = masked_logits.argmax(dim=-1)
-        acc = (preds == target).float().mean().item()
+        block_nll = weighted_nll.view(bsz, -1, block_size).mean(dim=-1)
+        block_nll_means.extend(block_nll.detach().float().cpu().reshape(-1).tolist())
 
-        total_loss += float(weighted_loss.item())
+        total_loss += float(loss.item())
         total_acc += float(acc)
         total_count += 1.0
 
@@ -217,10 +285,13 @@ def evaluate(
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     total_count = float(stats[2].item())
     if total_count == 0:
-        return {"val_loss": 0.0, "val_mask_acc": 0.0}
+        return {"val_loss": 0.0, "val_mask_acc": 0.0, "val_block_var": 0.0}
+    local_var = float(np.var(block_nll_means)) if block_nll_means else 0.0
+    var_mean = _reduce_mean(local_var, device)
     return {
         "val_loss": float(stats[0].item() / total_count),
         "val_mask_acc": float(stats[1].item() / total_count),
+        "val_block_var": float(var_mean),
     }
 
 
@@ -261,7 +332,9 @@ def main() -> None:
             else torch.device(str(cfg.runtime.device))
         )
         if device.type == "cuda":
-            torch.cuda.set_device(device)
+            cuda_idx = 0 if device.index is None else int(device.index)
+            torch.cuda.set_device(cuda_idx)
+            device = torch.device("cuda", cuda_idx)
 
     is_main = (rank == 0)
     world_size = _ddp_world_size()
@@ -391,10 +464,24 @@ def main() -> None:
     num_steps = int(cfg.train.max_steps)
     grad_clip = float(cfg.train.grad_clip)
 
-    schedule = ClippedMaskSchedule(
-        beta_low=float(cfg.diffusion.beta_low),
-        beta_high=float(cfg.diffusion.beta_high),
+    schedule = LogLinearSchedule(
+        eps_min=float(OmegaConf.select(cfg, "diffusion.eps_min", default=1.0e-3)),
+        eps_max=float(OmegaConf.select(cfg, "diffusion.eps_max", default=1.0)),
+        antithetic_sampling=bool(
+            OmegaConf.select(cfg, "diffusion.antithetic_sampling", default=True)
+        ),
+        resample=bool(OmegaConf.select(cfg, "diffusion.resample", default=False)),
     )
+    var_min_enabled = bool(OmegaConf.select(cfg, "diffusion.var_min", default=False))
+    fix_clipping = bool(OmegaConf.select(cfg, "diffusion.fix_clipping", default=False))
+    clip_search_delta = float(
+        OmegaConf.select(cfg, "diffusion.clip_search_delta", default=0.05)
+    )
+    clip_search_widths = list(
+        OmegaConf.select(cfg, "diffusion.clip_search_widths", default=[])
+    )
+    current_eps_min = float(schedule.eps_min)
+    current_eps_max = float(schedule.eps_max)
 
     optimizer = _build_optimizer(cfg, model, is_main)
     scaler = torch.amp.GradScaler(
@@ -458,16 +545,23 @@ def main() -> None:
                     raise RuntimeError(
                         f"Sequence length {seq_len} not divisible by block_size {block_size}"
                     )
-                num_blocks = seq_len // block_size
-
-                block_indices = torch.randint(0, num_blocks, (bsz,), device=device)
-                ratios = schedule.sample_ratio(bsz, device=device)
-                noisy_ids, masked = mask_one_block_per_sample(
-                    shape_ids=shape_ids,
-                    block_indices=block_indices,
-                    mask_ratios=ratios,
+                t = schedule.sample_t(
+                    batch_size=bsz,
+                    seq_len=seq_len,
                     block_size=block_size,
+                    device=device,
+                    eps_min=current_eps_min,
+                    eps_max=current_eps_max,
+                )
+                move_chance = schedule.move_chance(t)
+                noisy_ids, _ = q_xt(
+                    shape_ids,
+                    move_chance=move_chance,
                     mask_token_id=base_model.ensure_mask_token(),
+                    block_size=block_size,
+                    resample=schedule.resample,
+                    eps_min=current_eps_min,
+                    eps_max=current_eps_max,
                 )
 
                 sync_context = (
@@ -478,14 +572,31 @@ def main() -> None:
                 with sync_context:
                     with _autocast_context(device, amp_dtype):
                         cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
-                        logits = model(base_model.encode_token(noisy_ids), cond)[..., :num_codes]
+                        x_input = torch.cat([noisy_ids, shape_ids], dim=1)
+                        logits = model(
+                            base_model.encode_token(x_input),
+                            cond,
+                            attention_mode="bd_training",
+                            block_size=block_size,
+                        )
 
-                    target = shape_ids[masked]
-                    masked_logits = logits[masked]
-                    ce = F.cross_entropy(masked_logits.float(), target, reduction="none")
-                    weights = schedule.weight_from_ratio(ratios)
-                    token_weights = (weights[:, None].expand_as(masked))[masked]
-                    loss = (ce * token_weights).mean()
+                    logits = logits[:, :seq_len]
+                    logits, mask_local_idx = restrict_logits_to_codes_and_mask(
+                        logits=logits,
+                        num_codes=num_codes,
+                        mask_token_id=base_model.ensure_mask_token(),
+                    )
+                    log_probs = F.log_softmax(logits.float(), dim=-1)
+                    noisy_local = noisy_ids.clone()
+                    noisy_local[noisy_local == base_model.ensure_mask_token()] = mask_local_idx
+                    log_probs = subs_parameterization(
+                        log_probs=log_probs,
+                        xt_local=noisy_local,
+                        mask_index_local=mask_local_idx,
+                    )
+                    nll = -torch.gather(log_probs, -1, shape_ids.unsqueeze(-1)).squeeze(-1)
+                    weights = schedule.loss_scale(t)
+                    loss = (nll * weights).mean()
                     loss_to_backward = loss / grad_accum_steps
 
                     if scaler.is_enabled():
@@ -494,8 +605,12 @@ def main() -> None:
                         loss_to_backward.backward()
 
                 with torch.no_grad():
-                    pred = masked_logits.argmax(dim=-1)
-                    acc = (pred == target).float().mean().item()
+                    masked = noisy_ids.eq(base_model.ensure_mask_token())
+                    if masked.any():
+                        pred = logits.argmax(dim=-1)
+                        acc = (pred[masked] == shape_ids[masked]).float().mean().item()
+                    else:
+                        acc = 0.0
 
                 step_loss_sum += float(loss.item())
                 step_acc_sum += float(acc)
@@ -570,15 +685,61 @@ def main() -> None:
                     amp_dtype=amp_dtype,
                     device=device,
                     max_batches=int(cfg.train.val_max_batches),
+                    eps_min=current_eps_min,
+                    eps_max=current_eps_max,
                 )
+
+                best_interval = (current_eps_min, current_eps_max)
+                if var_min_enabled:
+                    intervals = _build_clip_intervals(
+                        eps_min=current_eps_min,
+                        eps_max=current_eps_max,
+                        clip_search_delta=clip_search_delta,
+                        clip_search_widths=clip_search_widths,
+                    )
+                    best_var = float("inf")
+                    for eps_min_i, eps_max_i in intervals:
+                        clip_metrics = evaluate(
+                            model=model,
+                            base_model=base_model,
+                            loader=val_loader,
+                            schedule=schedule,
+                            num_codes=num_codes,
+                            block_size=block_size,
+                            amp_dtype=amp_dtype,
+                            device=device,
+                            max_batches=int(
+                                OmegaConf.select(cfg, "train.val_var_batches", default=20)
+                            ),
+                            eps_min=float(eps_min_i),
+                            eps_max=float(eps_max_i),
+                        )
+                        clip_var = float(clip_metrics["val_block_var"])
+                        if is_main and writer is not None:
+                            writer.add_scalar(
+                                f"val/clip_var_{eps_min_i:.3f}_{eps_max_i:.3f}",
+                                clip_var,
+                                step,
+                            )
+                        if clip_var < best_var:
+                            best_var = clip_var
+                            best_interval = (float(eps_min_i), float(eps_max_i))
+                    if not fix_clipping:
+                        current_eps_min, current_eps_max = best_interval
+
                 if is_main:
                     print(
                         f"[val] step={step} val_loss={metrics['val_loss']:.4f} "
-                        f"val_mask_acc={metrics['val_mask_acc']:.4f}"
+                        f"val_mask_acc={metrics['val_mask_acc']:.4f} "
+                        f"val_block_var={metrics['val_block_var']:.6f} "
+                        f"eps=[{current_eps_min:.3f},{current_eps_max:.3f}]"
                     )
                     if writer is not None:
                         writer.add_scalar("val/loss", metrics["val_loss"], step)
                         writer.add_scalar("val/mask_acc", metrics["val_mask_acc"], step)
+                        writer.add_scalar("val/block_var", metrics["val_block_var"], step)
+                        writer.add_scalar("diffusion/eps_min", current_eps_min, step)
+                        writer.add_scalar("diffusion/eps_max", current_eps_max, step)
 
             if step % int(cfg.train.save_every) == 0 or step == num_steps:
                 if is_main:
@@ -589,6 +750,8 @@ def main() -> None:
                         "num_codes": num_codes,
                         "block_size": block_size,
                         "shape_mask_id": base_model.shape_mask_id,
+                        "eps_min": current_eps_min,
+                        "eps_max": current_eps_max,
                         "world_size": world_size,
                         "grad_accum_steps": grad_accum_steps,
                         "micro_batch_size_per_gpu": micro_batch_size,

@@ -206,6 +206,10 @@ class DualStreamRoformer(nn.Module):
         kv_cache: Optional[list[Cache]] = None,
         curr_pos_id: Optional[torch.Tensor] = None,
         decode: bool = False,
+        dual_attn_mask: Optional[torch.Tensor] = None,
+        single_attn_mask: Optional[torch.Tensor] = None,
+        dual_is_causal: bool = True,
+        single_is_causal: bool = True,
     ):
         """
         Forward pass for the dual-stream RoFormer model.
@@ -222,9 +226,11 @@ class DualStreamRoformer(nn.Module):
         s = cond.shape[1]
         device = embed.device
 
-        attn_mask = torch.tril(
-            torch.ones(s + l, s + l, dtype=torch.bool, device=device)
-        )
+        attn_mask = dual_attn_mask
+        if attn_mask is None:
+            attn_mask = torch.tril(
+                torch.ones(s + l, s + l, dtype=torch.bool, device=device)
+            )
 
         position_ids = torch.arange(l, dtype=torch.long, device=device)  # shape (t)
         position_ids = position_ids.unsqueeze_(0).expand(b, -1)
@@ -270,7 +276,7 @@ class DualStreamRoformer(nn.Module):
                         block,
                         freqs_cis=d_freqs_cis,
                         attn_mask=attn_mask,
-                        is_causal=True,
+                        is_causal=dual_is_causal,
                         kv_cache=None,
                         curr_pos_id=None,
                         decode=False,
@@ -285,7 +291,7 @@ class DualStreamRoformer(nn.Module):
                     c=c,
                     freqs_cis=d_freqs_cis,
                     attn_mask=attn_mask,
-                    is_causal=True,
+                    is_causal=dual_is_causal,
                     kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
                     curr_pos_id=curr_pos_id + s if curr_pos_id is not None else None,
                     decode=decode,
@@ -297,8 +303,8 @@ class DualStreamRoformer(nn.Module):
                     partial(
                         block,
                         freqs_cis=s_freqs_cis,
-                        attn_mask=None,
-                        is_causal=True,
+                        attn_mask=single_attn_mask,
+                        is_causal=single_is_causal,
                         kv_cache=None,
                         curr_pos_id=None,
                         decode=False,
@@ -310,8 +316,8 @@ class DualStreamRoformer(nn.Module):
                 h = block(
                     h,
                     freqs_cis=s_freqs_cis,
-                    attn_mask=None,
-                    is_causal=True,
+                    attn_mask=single_attn_mask,
+                    is_causal=single_is_causal,
                     kv_cache=kv_cache[layer_idx] if kv_cache is not None else None,
                     curr_pos_id=curr_pos_id,
                     decode=decode,

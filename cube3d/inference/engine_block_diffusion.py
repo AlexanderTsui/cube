@@ -1,4 +1,3 @@
-from math import ceil
 from typing import Optional, Tuple
 
 import torch
@@ -11,25 +10,22 @@ from cube3d.model.autoencoder.one_d_autoencoder import OneDAutoEncoder
 from cube3d.model.gpt.block_diffusion_roformer import BlockDiffusionRoformer
 
 
-def _sample_from_logits(logits: torch.Tensor, top_p: Optional[float]) -> torch.Tensor:
-    """
-    Args:
-        logits: [N, V]
-    Returns:
-        sampled token ids [N]
-    """
-    if top_p is None:
-        return torch.argmax(logits, dim=-1)
+def _sample_categorical(probs: torch.Tensor) -> torch.Tensor:
+    gumbel = 1.0e-10 - (torch.rand_like(probs) + 1.0e-10).log()
+    return (probs / gumbel).argmax(dim=-1)
 
-    probs = F.softmax(logits, dim=-1)
+
+def _nucleus_on_probs(probs: torch.Tensor, top_p: Optional[float]) -> torch.Tensor:
+    if top_p is None or top_p >= 1.0:
+        return probs
     sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
     cumsum = sorted_probs.cumsum(dim=-1)
-    to_remove = cumsum > top_p
-    to_remove[..., 0] = False
-    sorted_probs = sorted_probs.masked_fill(to_remove, 0.0)
-    sorted_probs = sorted_probs / torch.clamp(sorted_probs.sum(dim=-1, keepdim=True), min=1e-12)
-    chosen = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
-    return sorted_idx.gather(-1, chosen.unsqueeze(-1)).squeeze(-1)
+    nucleus_mask = cumsum <= top_p
+    nucleus_mask[..., 0] = True
+    sorted_probs = sorted_probs * nucleus_mask
+    filtered = torch.zeros_like(probs)
+    filtered.scatter_(-1, sorted_idx, sorted_probs)
+    return filtered / torch.clamp(filtered.sum(dim=-1, keepdim=True), min=1.0e-12)
 
 
 class EngineBlockDiffusion:
@@ -82,6 +78,9 @@ class EngineBlockDiffusion:
         self.min_id = 0
         self.max_id = int(self.shape_model.cfg.num_codes)
         self.mask_id = int(self.gpt_model.ensure_mask_token())
+        self.first_hitting = bool(
+            getattr(getattr(self.cfg, "diffusion", {}), "first_hitting", False)
+        )
 
     def _autocast_context(self):
         return torch.autocast(
@@ -134,11 +133,27 @@ class EngineBlockDiffusion:
         return self.prepare_conditions_with_bbox(prompt_embeds, cond_bbox)
 
     @torch.inference_mode()
-    def _predict_logits(self, shape_ids: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def _predict_log_probs(self, shape_ids: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         with self._autocast_context():
             embed = self.gpt_model.encode_token(shape_ids)
-            logits = self.gpt_model(embed, cond)
-        return logits[..., self.min_id : self.max_id]
+            logits = self.gpt_model(
+                embed,
+                cond,
+                attention_mode="block_causal",
+                block_size=self.block_size,
+            )
+        code_logits = logits[..., self.min_id : self.max_id]
+        mask_logit = logits[..., self.mask_id : self.mask_id + 1]
+        restricted = torch.cat([code_logits, mask_logit], dim=-1)
+        log_probs = F.log_softmax(restricted.float(), dim=-1)
+
+        local_mask_idx = self.max_id
+        local_shape_ids = shape_ids.clone()
+        local_shape_ids[local_shape_ids == self.mask_id] = local_mask_idx
+        unmasked = local_shape_ids != local_mask_idx
+        log_probs[unmasked] = -1.0e6
+        log_probs[unmasked, local_shape_ids[unmasked]] = 0.0
+        return log_probs
 
     @torch.inference_mode()
     def run_gpt(
@@ -160,48 +175,71 @@ class EngineBlockDiffusion:
             device=self.device,
         )
 
+        dt = 1.0 / max(self.num_denoise_steps, 1)
+        ones = torch.ones((bsz, 1), device=self.device, dtype=torch.float32)
+        local_mask_idx = self.max_id
+
         for block_idx in tqdm(range(num_blocks), desc="block diffusion"):
             start = block_idx * self.block_size
             end = start + self.block_size
 
-            block_mask = shape_ids[:, start:end].eq(self.mask_id)
+            block_ids = shape_ids[:, start:end]
+            if self.mask_id not in block_ids:
+                continue
+
+            t_scalar = 1.0
             for denoise_step in range(self.num_denoise_steps):
-                logits = self._predict_logits(shape_ids, cond)
-                block_logits = logits[:, start:end, :]
-                probs = F.softmax(block_logits.float(), dim=-1)
-                confidence, _ = probs.max(dim=-1)
-                candidates = _sample_from_logits(block_logits.reshape(-1, block_logits.shape[-1]), top_p)
-                candidates = candidates.view(bsz, self.block_size)
-
-                remaining_counts = block_mask.sum(dim=1)
-                steps_left = self.num_denoise_steps - denoise_step
-                update_counts = torch.clamp(
-                    torch.ceil(remaining_counts.float() / max(steps_left, 1)).long(),
-                    min=1,
-                )
-
-                for i in range(bsz):
-                    if remaining_counts[i] == 0:
-                        continue
-                    mask_pos = torch.nonzero(block_mask[i], as_tuple=False).squeeze(-1)
-                    k = int(min(update_counts[i].item(), mask_pos.numel()))
-                    masked_conf = confidence[i, mask_pos]
-                    _, top_idx = torch.topk(masked_conf, k=k, largest=True)
-                    chosen_rel = mask_pos[top_idx]
-                    shape_ids[i, start + chosen_rel] = candidates[i, chosen_rel]
-                    block_mask[i, chosen_rel] = False
-
+                block_mask = shape_ids[:, start:end].eq(self.mask_id)
                 if not block_mask.any():
                     break
+                if self.first_hitting:
+                    num_masked = block_mask.sum(dim=-1).clamp(min=1).float()
+                    u = torch.rand((bsz,), device=self.device).clamp_(1.0e-6, 1.0)
+                    t_vec = (t_scalar * torch.pow(u, 1.0 / num_masked)).view(-1, 1)
+                    t_scalar = float(t_vec.mean().item())
+                else:
+                    t_scalar = max(1.0 - denoise_step * dt, 1.0e-3)
+                    t_vec = t_scalar * ones
+                s_vec = torch.clamp(t_vec - dt, min=1.0e-6)
+                mask_prob = torch.clamp(s_vec / torch.clamp(t_vec, min=1.0e-6), 0.0, 1.0)
 
+                probs = self._predict_log_probs(shape_ids, cond).exp()
+                probs = _nucleus_on_probs(probs, top_p=top_p)
+                p_block = probs[:, start:end, :]
+
+                if self.first_hitting:
+                    x_block = _sample_categorical(p_block)
+                    for i in range(bsz):
+                        mask_pos = torch.nonzero(block_mask[i], as_tuple=False).squeeze(-1)
+                        if mask_pos.numel() == 0:
+                            continue
+                        chosen = mask_pos[torch.randint(0, mask_pos.numel(), (1,), device=self.device)]
+                        keep = shape_ids[i, start:end].clone()
+                        keep[chosen] = x_block[i, chosen]
+                        x_block[i] = keep
+                else:
+                    q_xs = p_block * (1.0 - mask_prob[:, None, :])
+                    q_xs[:, :, local_mask_idx] = mask_prob.squeeze(-1).unsqueeze(-1)
+                    x_block = _sample_categorical(q_xs)
+
+                x_block_global = x_block.clone()
+                x_block_global[x_block_global == local_mask_idx] = self.mask_id
+                copy_flag = (~block_mask).to(x_block_global.dtype)
+                x_block_global = copy_flag * shape_ids[:, start:end] + (1 - copy_flag) * x_block_global
+                shape_ids[:, start:end] = x_block_global
+
+            block_mask = shape_ids[:, start:end].eq(self.mask_id)
             if block_mask.any():
-                # Safety fallback to ensure no [MASK] remains in the block.
-                logits = self._predict_logits(shape_ids, cond)[:, start:end, :]
-                fill = torch.argmax(logits, dim=-1)
+                probs = self._predict_log_probs(shape_ids, cond).exp()[:, start:end, :]
+                probs[:, :, local_mask_idx] = 0.0
+                probs = probs / torch.clamp(probs.sum(dim=-1, keepdim=True), min=1.0e-12)
+                x_block = _sample_categorical(probs)
+                x_block_global = x_block.clone()
+                x_block_global[x_block_global == local_mask_idx] = self.mask_id
                 for i in range(bsz):
                     mask_pos = torch.nonzero(block_mask[i], as_tuple=False).squeeze(-1)
                     if mask_pos.numel() > 0:
-                        shape_ids[i, start + mask_pos] = fill[i, mask_pos]
+                        shape_ids[i, start + mask_pos] = x_block_global[i, mask_pos]
 
         return shape_ids
 

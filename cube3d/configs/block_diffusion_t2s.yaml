@@ -17,9 +17,16 @@ data:
 diffusion:
   block_size: 32
   num_steps: 8
-  beta_low: 0.3
-  beta_high: 0.8
+  eps_min: 0.001
+  eps_max: 1.0
+  antithetic_sampling: true
+  resample: false
+  var_min: true
+  clip_search_delta: 0.05
+  clip_search_widths: [0.5, 0.6, 0.7, 0.8, 0.9]
+  fix_clipping: false
   cfg_drop_prob: 0.1
+  first_hitting: false
 
 train:
   batch_size: 1
@@ -38,6 +45,7 @@ train:
   log_every: 20
   eval_every: 100
   val_max_batches: 20
+  val_var_batches: 20
   save_every: 500
 
 logging:
