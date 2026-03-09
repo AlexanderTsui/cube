@@ -3,7 +3,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 from omegaconf import DictConfig, OmegaConf
-from safetensors.torch import load_model
+from safetensors.torch import load_file, load_model
 
 BOUNDING_BOX_MAX_SIZE = 1.925
 
@@ -61,6 +61,84 @@ def load_model_weights(model: torch.nn.Module, ckpt_path: str) -> None:
     ), f"Checkpoint path '{ckpt_path}' is not a safetensors file"
 
     load_model(model, ckpt_path)
+
+
+def load_model_weights_flexible(
+    model: torch.nn.Module,
+    ckpt_path: str,
+    *,
+    is_main: bool = True,
+    max_report: int = 6,
+) -> dict[str, int]:
+    """
+    Flexible safetensors loader for architecture evolution.
+
+    Rules:
+    - Exact-shape parameters are loaded directly.
+    - Prefix-compatible tensors (same trailing dims, smaller first dim) are
+      copied into the beginning of target tensor.
+    - Others are skipped.
+    """
+    assert ckpt_path.endswith(
+        ".safetensors"
+    ), f"Checkpoint path '{ckpt_path}' is not a safetensors file"
+
+    ckpt_state = load_file(ckpt_path)
+    model_state = model.state_dict()
+    patched_state: dict[str, torch.Tensor] = {}
+    partial_keys: list[str] = []
+    skipped_keys: list[str] = []
+
+    for key, value in ckpt_state.items():
+        if key not in model_state:
+            skipped_keys.append(key)
+            continue
+        target = model_state[key]
+        if value.shape == target.shape:
+            patched_state[key] = value.to(device=target.device, dtype=target.dtype)
+            continue
+        if (
+            value.ndim == target.ndim
+            and value.shape[1:] == target.shape[1:]
+            and value.shape[0] <= target.shape[0]
+        ):
+            patched = target.clone()
+            patched[: value.shape[0]].copy_(
+                value.to(device=target.device, dtype=target.dtype)
+            )
+            patched_state[key] = patched
+            partial_keys.append(key)
+            continue
+        skipped_keys.append(key)
+
+    missing_keys, unexpected_keys = model.load_state_dict(patched_state, strict=False)
+
+    if is_main:
+        print(
+            "[info] flexible load: "
+            f"loaded={len(patched_state)} partial={len(partial_keys)} "
+            f"missing={len(missing_keys)} unexpected={len(unexpected_keys)} "
+            f"skipped={len(skipped_keys)}"
+        )
+        if len(partial_keys) > 0:
+            print(f"[info] partial keys (first {max_report}): {partial_keys[:max_report]}")
+        if len(missing_keys) > 0:
+            print(f"[info] missing keys (first {max_report}): {missing_keys[:max_report]}")
+        if len(unexpected_keys) > 0:
+            print(
+                f"[info] unexpected keys (first {max_report}): "
+                f"{unexpected_keys[:max_report]}"
+            )
+        if len(skipped_keys) > 0:
+            print(f"[info] skipped keys (first {max_report}): {skipped_keys[:max_report]}")
+
+    return {
+        "loaded": len(patched_state),
+        "partial": len(partial_keys),
+        "missing": len(missing_keys),
+        "unexpected": len(unexpected_keys),
+        "skipped": len(skipped_keys),
+    }
 
 
 def select_device() -> Any:

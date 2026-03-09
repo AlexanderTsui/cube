@@ -43,6 +43,21 @@ class LogLinearSchedule:
     def move_chance(t: torch.Tensor) -> torch.Tensor:
         return torch.clamp(t, min=0.0, max=1.0)
 
+    @staticmethod
+    def sigma_from_move_chance(
+        move_chance: torch.Tensor,
+        eps: float = 1.0e-6,
+    ) -> torch.Tensor:
+        p = torch.clamp(move_chance, min=eps, max=1.0 - eps)
+        return -torch.log1p(-p)
+
+    def compute_loss_scaling_and_move_chance(
+        self,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        move_chance = self.move_chance(t)
+        return self.loss_scale(move_chance), move_chance
+
 
 def q_xt(
     x0: torch.Tensor,

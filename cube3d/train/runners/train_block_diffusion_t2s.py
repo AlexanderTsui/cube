@@ -22,11 +22,9 @@ from tqdm import tqdm
 from cube3d.inference.utils import (
     load_config,
     load_model_weights,
-    parse_structured,
     select_device,
 )
-from cube3d.model.autoencoder.one_d_autoencoder import OneDAutoEncoder
-from cube3d.model.gpt.block_diffusion_roformer import BlockDiffusionRoformer
+from cube3d.model.gpt.block_diffusion_dit import BlockDiffusionDiT
 from cube3d.train.data.block_diffusion_dataset import BlockDiffusionDataset
 from cube3d.train.noise.bd3_schedule import (
     LogLinearSchedule,
@@ -80,22 +78,6 @@ def _ddp_rank() -> int:
     return dist.get_rank() if _is_distributed() else 0
 
 
-def _is_main_process() -> bool:
-    return _ddp_rank() == 0
-
-
-def _prepare_condition(
-    gpt_model: BlockDiffusionRoformer,
-    text_hidden: torch.Tensor,
-    bbox_xyz: torch.Tensor,
-) -> torch.Tensor:
-    cond = gpt_model.encode_text(text_hidden)
-    if hasattr(gpt_model, "bbox_proj"):
-        cond_bbox = gpt_model.bbox_proj(bbox_xyz).unsqueeze(1)
-        cond = torch.cat([cond, cond_bbox], dim=1)
-    return cond
-
-
 def _reduce_mean(value: float, device: torch.device) -> float:
     if not _is_distributed():
         return float(value)
@@ -121,6 +103,7 @@ def _build_clip_intervals(
     intervals: list[tuple[float, float]] = [(float(eps_min), float(eps_max))]
     if clip_search_delta <= 0 or len(clip_search_widths) == 0:
         return intervals
+
     for width in clip_search_widths:
         w = float(width)
         if w <= 0 or w > 1:
@@ -133,7 +116,7 @@ def _build_clip_intervals(
             if hi <= 1.0 + 1e-8:
                 intervals.append((round(lo, 6), round(min(1.0, hi), 6)))
             i += clip_search_delta
-    # keep deterministic unique order
+
     seen: set[tuple[float, float]] = set()
     deduped: list[tuple[float, float]] = []
     for pair in intervals:
@@ -145,7 +128,9 @@ def _build_clip_intervals(
 
 
 def _build_optimizer(
-    cfg: DictConfig, model: torch.nn.Module, is_main: bool
+    cfg: DictConfig,
+    model: torch.nn.Module,
+    is_main: bool,
 ) -> torch.optim.Optimizer:
     optimizer_name = str(OmegaConf.select(cfg, "train.optimizer", default="adamw")).lower()
     lr = float(cfg.train.lr)
@@ -192,10 +177,58 @@ def _build_optimizer(
     )
 
 
+def _prepare_cfg_unconditional(
+    text_hidden: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    bbox_xyz: torch.Tensor,
+    drop_prob: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if drop_prob <= 0:
+        return text_hidden, text_attention_mask, bbox_xyz
+
+    bsz = int(text_hidden.shape[0])
+    drop_mask = torch.rand((bsz,), device=text_hidden.device) < drop_prob
+    if not drop_mask.any():
+        return text_hidden, text_attention_mask, bbox_xyz
+
+    text_hidden = text_hidden.clone()
+    text_attention_mask = text_attention_mask.clone()
+    bbox_xyz = bbox_xyz.clone()
+
+    text_hidden[drop_mask] = 0
+    text_attention_mask[drop_mask] = False
+    bbox_xyz[drop_mask] = 0
+    return text_hidden, text_attention_mask, bbox_xyz
+
+
+def _forward_bd_training(
+    model: torch.nn.Module,
+    shape_ids: torch.Tensor,
+    noisy_ids: torch.Tensor,
+    text_hidden: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    bbox_xyz: torch.Tensor,
+    block_size: int,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    x_input = torch.cat([noisy_ids, shape_ids], dim=1)
+    return model(
+        x_input,
+        sigma=sigma,
+        attention_mode="bd_training",
+        block_size=block_size,
+        text_hidden=text_hidden,
+        text_attention_mask=text_attention_mask,
+        bbox_xyz=bbox_xyz,
+        sample_mode=False,
+        store_kv=False,
+    )
+
+
 @torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
-    base_model: BlockDiffusionRoformer,
+    base_model: BlockDiffusionDiT,
     loader: DataLoader,
     schedule: LogLinearSchedule,
     num_codes: int,
@@ -217,8 +250,10 @@ def evaluate(
     for batch_idx, batch in enumerate(loader):
         if max_batches > 0 and batch_idx >= max_batches:
             break
+
         shape_ids = batch["shape_ids"].to(device, non_blocking=True)
         text_hidden = batch["text_hidden"].to(device, non_blocking=True)
+        text_attention_mask = batch["text_attention_mask"].to(device, non_blocking=True)
         bbox_xyz = batch["bbox_xyz"].to(device, non_blocking=True)
 
         bsz, seq_len = shape_ids.shape
@@ -230,7 +265,8 @@ def evaluate(
             eps_min=eps_min,
             eps_max=eps_max,
         )
-        move_chance = schedule.move_chance(t)
+        loss_scale, move_chance = schedule.compute_loss_scaling_and_move_chance(t)
+        sigma = schedule.sigma_from_move_chance(move_chance[:, :1])
         noisy_ids, _ = q_xt(
             shape_ids,
             move_chance=move_chance,
@@ -242,15 +278,17 @@ def evaluate(
         )
 
         with _autocast_context(device, amp_dtype):
-            cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
-            x_input = torch.cat([noisy_ids, shape_ids], dim=1)
-            logits = model(
-                base_model.encode_token(x_input),
-                cond,
-                attention_mode="bd_training",
+            logits = _forward_bd_training(
+                model=model,
+                shape_ids=shape_ids,
+                noisy_ids=noisy_ids,
+                text_hidden=text_hidden,
+                text_attention_mask=text_attention_mask,
+                bbox_xyz=bbox_xyz,
                 block_size=block_size,
+                sigma=sigma,
             )
-        logits = logits[:, :seq_len]
+
         logits, mask_local_idx = restrict_logits_to_codes_and_mask(
             logits=logits,
             num_codes=num_codes,
@@ -262,8 +300,7 @@ def evaluate(
         log_probs = subs_parameterization(log_probs, noisy_local, mask_local_idx)
 
         nll = -torch.gather(log_probs, -1, shape_ids.unsqueeze(-1)).squeeze(-1)
-        weights = schedule.loss_scale(t)
-        weighted_nll = nll * weights
+        weighted_nll = nll * loss_scale
         loss = weighted_nll.mean()
 
         masked = noisy_ids.eq(mask_token_id)
@@ -286,6 +323,7 @@ def evaluate(
     total_count = float(stats[2].item())
     if total_count == 0:
         return {"val_loss": 0.0, "val_mask_acc": 0.0, "val_block_var": 0.0}
+
     local_var = float(np.var(block_nll_means)) if block_nll_means else 0.0
     var_mean = _reduce_mean(local_var, device)
     return {
@@ -313,6 +351,45 @@ def _init_distributed(cfg: DictConfig) -> tuple[bool, int, int]:
     return True, rank, local_rank
 
 
+def _build_model_cfg(cfg: DictConfig, base_cfg: DictConfig) -> BlockDiffusionDiT.Config:
+    model_cfg = OmegaConf.select(cfg, "diffusion.model", default={})
+
+    def _pick(path: str, default):
+        value = OmegaConf.select(model_cfg, path, default=None)
+        return default if value is None else value
+
+    default_layers = int(base_cfg.gpt_model.n_layer + base_cfg.gpt_model.n_single_layer)
+    n_layer = int(_pick("n_layer", default_layers))
+    n_head = int(_pick("n_head", int(base_cfg.gpt_model.n_head)))
+    n_embd = int(_pick("n_embd", int(base_cfg.gpt_model.n_embd)))
+    cond_dim = int(_pick("cond_dim", n_embd))
+    text_cond_dim = int(
+        _pick("text_cond_dim", int(base_cfg.gpt_model.text_model_embed_dim))
+    )
+    rope_theta = float(_pick("rope_theta", float(base_cfg.gpt_model.rope_theta)))
+    use_bbox = bool(_pick("use_bbox", bool(base_cfg.gpt_model.use_bbox)))
+
+    return BlockDiffusionDiT.Config(
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        eps=float(_pick("eps", float(base_cfg.gpt_model.eps))),
+        rope_theta=rope_theta,
+        shape_model_vocab_size=int(base_cfg.shape_model.num_codes),
+        cond_dim=cond_dim,
+        text_cond_dim=text_cond_dim,
+        use_bbox=use_bbox,
+        time_conditioning=bool(_pick("time_conditioning", False)),
+        dropout=float(_pick("dropout", 0.0)),
+        cross_attn_dropout=float(_pick("cross_attn_dropout", 0.0)),
+        attn_backend=str(_pick("attn_backend", "flash_attn")),
+        max_seqlen=int(
+            _pick("max_seqlen", int(base_cfg.shape_model.num_encoder_latents))
+        ),
+        add_mask_token=bool(_pick("add_mask_token", True)),
+    )
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -336,7 +413,7 @@ def main() -> None:
             torch.cuda.set_device(cuda_idx)
             device = torch.device("cuda", cuda_idx)
 
-    is_main = (rank == 0)
+    is_main = rank == 0
     world_size = _ddp_world_size()
     amp_dtype = _resolve_amp_dtype(str(cfg.train.amp_dtype))
 
@@ -372,6 +449,7 @@ def main() -> None:
     grad_accum_steps = int(OmegaConf.select(cfg, "train.grad_accum_steps", default=1))
     if grad_accum_steps < 1:
         raise ValueError("train.grad_accum_steps must be >= 1")
+
     if is_main:
         effective_batch = micro_batch_size * grad_accum_steps * world_size
         print(
@@ -417,37 +495,18 @@ def main() -> None:
         drop_last=False,
     )
 
-    gpt_cfg = parse_structured(
-        BlockDiffusionRoformer.Config,
-        base_cfg.gpt_model,
-    )
-    base_model = BlockDiffusionRoformer(gpt_cfg)
-    load_model_weights(base_model, str(cfg.model.gpt_ckpt_path))
-    base_model = base_model.to(device)
+    dit_cfg = _build_model_cfg(cfg, base_cfg)
+    base_model = BlockDiffusionDiT(dit_cfg).to(device)
 
-    shape_model = OneDAutoEncoder(
-        parse_structured(OneDAutoEncoder.Config, base_cfg.shape_model)
-    )
-    load_model_weights(shape_model, str(cfg.model.shape_ckpt_path))
-    shape_model = shape_model.eval().to(device)
-
-    # Align shape token embeddings with tokenizer codebook for stable initialization.
-    with torch.no_grad():
-        codebook = shape_model.bottleneck.block.get_codebook()
-        codebook = base_model.shape_proj(codebook).detach()
-        codebook = codebook.to(
-            base_model.transformer.wte.weight.device,
-            dtype=base_model.transformer.wte.weight.dtype,
-        )
-        base_model.transformer.wte.weight.data[: codebook.shape[0]] = codebook
-        base_model.lm_head.weight.data[: codebook.shape[0]] = codebook
+    load_ckpt = bool(OmegaConf.select(cfg, "diffusion.model.load_ckpt", default=False))
+    if load_ckpt:
+        load_model_weights(base_model, str(cfg.model.gpt_ckpt_path))
 
     base_model.ensure_mask_token()
     base_model.set_gradient_checkpointing(
         bool(OmegaConf.select(cfg, "train.grad_checkpoint", default=False))
     )
     base_model = base_model.train()
-    del shape_model
 
     model: torch.nn.Module = base_model
     if use_distributed:
@@ -472,14 +531,12 @@ def main() -> None:
         ),
         resample=bool(OmegaConf.select(cfg, "diffusion.resample", default=False)),
     )
+
+    cond_drop_prob = float(OmegaConf.select(cfg, "diffusion.cond_drop_prob", default=0.1))
     var_min_enabled = bool(OmegaConf.select(cfg, "diffusion.var_min", default=False))
     fix_clipping = bool(OmegaConf.select(cfg, "diffusion.fix_clipping", default=False))
-    clip_search_delta = float(
-        OmegaConf.select(cfg, "diffusion.clip_search_delta", default=0.05)
-    )
-    clip_search_widths = list(
-        OmegaConf.select(cfg, "diffusion.clip_search_widths", default=[])
-    )
+    clip_search_delta = float(OmegaConf.select(cfg, "diffusion.clip_search_delta", default=0.05))
+    clip_search_widths = list(OmegaConf.select(cfg, "diffusion.clip_search_widths", default=[]))
     current_eps_min = float(schedule.eps_min)
     current_eps_max = float(schedule.eps_max)
 
@@ -501,6 +558,7 @@ def main() -> None:
     running_acc = 0.0
     running_count = 0.0
     running_iter_time = 0.0
+
     train_epoch = 0
     if train_sampler is not None:
         train_sampler.set_epoch(train_epoch)
@@ -530,21 +588,22 @@ def main() -> None:
 
                 shape_ids = batch["shape_ids"].to(device, non_blocking=True)
                 text_hidden = batch["text_hidden"].to(device, non_blocking=True)
+                text_attention_mask = batch["text_attention_mask"].to(device, non_blocking=True)
                 bbox_xyz = batch["bbox_xyz"].to(device, non_blocking=True)
 
-                if float(cfg.diffusion.cfg_drop_prob) > 0:
-                    drop_mask = (
-                        torch.rand(shape_ids.shape[0], device=device)
-                        < float(cfg.diffusion.cfg_drop_prob)
-                    )
-                    text_hidden = text_hidden.clone()
-                    text_hidden[drop_mask] = 0
+                text_hidden, text_attention_mask, bbox_xyz = _prepare_cfg_unconditional(
+                    text_hidden=text_hidden,
+                    text_attention_mask=text_attention_mask,
+                    bbox_xyz=bbox_xyz,
+                    drop_prob=cond_drop_prob,
+                )
 
                 bsz, seq_len = shape_ids.shape
                 if seq_len % block_size != 0:
                     raise RuntimeError(
                         f"Sequence length {seq_len} not divisible by block_size {block_size}"
                     )
+
                 t = schedule.sample_t(
                     batch_size=bsz,
                     seq_len=seq_len,
@@ -553,7 +612,9 @@ def main() -> None:
                     eps_min=current_eps_min,
                     eps_max=current_eps_max,
                 )
-                move_chance = schedule.move_chance(t)
+                loss_scale, move_chance = schedule.compute_loss_scaling_and_move_chance(t)
+                sigma = schedule.sigma_from_move_chance(move_chance[:, :1])
+
                 noisy_ids, _ = q_xt(
                     shape_ids,
                     move_chance=move_chance,
@@ -571,16 +632,17 @@ def main() -> None:
                 )
                 with sync_context:
                     with _autocast_context(device, amp_dtype):
-                        cond = _prepare_condition(base_model, text_hidden, bbox_xyz)
-                        x_input = torch.cat([noisy_ids, shape_ids], dim=1)
-                        logits = model(
-                            base_model.encode_token(x_input),
-                            cond,
-                            attention_mode="bd_training",
+                        logits = _forward_bd_training(
+                            model=model,
+                            shape_ids=shape_ids,
+                            noisy_ids=noisy_ids,
+                            text_hidden=text_hidden,
+                            text_attention_mask=text_attention_mask,
+                            bbox_xyz=bbox_xyz,
                             block_size=block_size,
+                            sigma=sigma,
                         )
 
-                    logits = logits[:, :seq_len]
                     logits, mask_local_idx = restrict_logits_to_codes_and_mask(
                         logits=logits,
                         num_codes=num_codes,
@@ -594,9 +656,9 @@ def main() -> None:
                         xt_local=noisy_local,
                         mask_index_local=mask_local_idx,
                     )
+
                     nll = -torch.gather(log_probs, -1, shape_ids.unsqueeze(-1)).squeeze(-1)
-                    weights = schedule.loss_scale(t)
-                    loss = (nll * weights).mean()
+                    loss = (nll * loss_scale).mean()
                     loss_to_backward = loss / grad_accum_steps
 
                     if scaler.is_enabled():
@@ -708,9 +770,7 @@ def main() -> None:
                             block_size=block_size,
                             amp_dtype=amp_dtype,
                             device=device,
-                            max_batches=int(
-                                OmegaConf.select(cfg, "train.val_var_batches", default=20)
-                            ),
+                            max_batches=int(OmegaConf.select(cfg, "train.val_var_batches", default=20)),
                             eps_min=float(eps_min_i),
                             eps_max=float(eps_max_i),
                         )
@@ -747,6 +807,7 @@ def main() -> None:
                     save_model(base_model, str(ckpt_path))
                     meta = {
                         "step": step,
+                        "backbone": "single_stream_dit_official_aligned",
                         "num_codes": num_codes,
                         "block_size": block_size,
                         "shape_mask_id": base_model.shape_mask_id,
@@ -755,6 +816,11 @@ def main() -> None:
                         "world_size": world_size,
                         "grad_accum_steps": grad_accum_steps,
                         "micro_batch_size_per_gpu": micro_batch_size,
+                        "cond_drop_prob": cond_drop_prob,
+                        "cfg_scale_default": float(
+                            OmegaConf.select(cfg, "diffusion.cfg_scale", default=1.0)
+                        ),
+                        "attn_backend": base_model.attn_backend,
                     }
                     with open(
                         output_dir / f"block_diffusion_step_{step}.json",

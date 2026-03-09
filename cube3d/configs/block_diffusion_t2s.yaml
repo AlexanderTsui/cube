@@ -16,17 +16,41 @@ data:
 
 diffusion:
   block_size: 32
-  num_steps: 8
+  num_denoise_steps: 8
+  first_hitting: true
+  kv_cache: true
+  context_size: 1024
+  nucleus_p: 1.0
+  cfg_scale: 4.0
+
+  cond_drop_prob: 0.1
+
   eps_min: 0.001
   eps_max: 1.0
   antithetic_sampling: true
   resample: false
+
   var_min: true
   clip_search_delta: 0.05
   clip_search_widths: [0.5, 0.6, 0.7, 0.8, 0.9]
   fix_clipping: false
-  cfg_drop_prob: 0.1
-  first_hitting: false
+
+  model:
+    n_layer: null # null -> n_layer + n_single_layer from base GPT config
+    n_head: null # null -> base gpt_model.n_head
+    n_embd: null # null -> base gpt_model.n_embd
+    cond_dim: null # null -> n_embd
+    text_cond_dim: null # null -> base gpt_model.text_model_embed_dim
+    eps: null # null -> base gpt_model.eps
+    rope_theta: null # null -> base gpt_model.rope_theta
+    time_conditioning: false
+    use_bbox: true
+    dropout: 0.0
+    cross_attn_dropout: 0.0
+    attn_backend: "flash_attn" # flash_attn | sdpa
+    max_seqlen: 1024
+    add_mask_token: true
+    load_ckpt: false
 
 train:
   batch_size: 1

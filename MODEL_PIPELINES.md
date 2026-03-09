@@ -5,6 +5,12 @@
 1. `shape tokenizer`：几何 <-> 离散 token（`OneDAutoEncoder`）
 2. `text -> token -> mesh`：文本到形状（`Engine`/`EngineFast` + `DualStreamRoformer`）
 
+> 文档状态说明（2026-03-09）：
+> 本文主要覆盖原始 AR 推理链路。Block Diffusion 训练/推理与新骨架说明已拆分到：
+> - `BLOCK_DIFFUSION_TRAINING_PLAN.md`
+> - `BLOCK_DIFFUSION_T2S_ARCHITECTURE.md`
+> - `BLOCK_DIFFUSION_SINGLE_STREAM_DIT_OPTION.md`
+
 ---
 
 ## 0. 入口、配置与记号
